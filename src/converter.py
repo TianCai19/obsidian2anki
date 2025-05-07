@@ -3,71 +3,72 @@
 import frontmatter
 import markdown
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
+import re
 from .card_types import create_card_handler
 from .anki_connect import ensure_deck_exists, add_note
 
-def convert_markdown_to_html(text: str) -> str:
-    """Convert markdown text to HTML."""
-    return markdown.markdown(text, extensions=['extra'])
+def extract_and_replace_math(content: str) -> Tuple[str, dict]:
+    """Replace math blocks and inline math with unique placeholders and return mapping."""
+    math_map = {}
+    # Block math: $$...$$
+    def block_repl(match):
+        key = f"[[[MATH_BLOCK_{len(math_map)}]]]"
+        math_map[key] = f"\\[{match.group(1).strip()}\\]"
+        return key
+    content = re.sub(r'(?<!\\)\$\$([\s\S]+?)(?<!\\)\$\$', block_repl, content)
+    # Inline math: $...$
+    def inline_repl(match):
+        key = f"[[[MATH_INLINE_{len(math_map)}]]]"
+        math_map[key] = f"\\({match.group(1).strip()}\\)"
+        return key
+    content = re.sub(r'(?<!\\)\$(?!\$)([^\$\n]+?)(?<!\\)\$', inline_repl, content)
+    return content, math_map
 
-def process_obsidian_file(file_path: Path, card_type: str = 'qa') -> List[Dict[str, Any]]:
+def restore_math_placeholders(html: str, math_map: dict) -> str:
+    """Restore math placeholders in HTML output."""
+    for key, value in math_map.items():
+        html = html.replace(key, value)
+    return html
+
+def convert_markdown_to_html(content: str) -> str:
+    """Convert markdown to HTML for Anki, preserving math as raw TeX."""
+    # Replace math with placeholders
+    content, math_map = extract_and_replace_math(content)
+    # Convert markdown to HTML
+    html = markdown.markdown(content, extensions=['extra'])
+    # Restore math placeholders as raw TeX
+    html = restore_math_placeholders(html, math_map)
+    return html
+
+def process_obsidian_file(file_path: Path, card_type: str) -> List[Tuple[str, str]]:
     """Process a single Obsidian markdown file."""
     with open(file_path, 'r', encoding='utf-8') as f:
-        post = frontmatter.load(f)
-        content = post.content
-        
-        # Get tags from frontmatter
-        tags = post.get('tags', [])
-        if isinstance(tags, str):
-            tags = [tag.strip() for tag in tags.split(',')]
-        
-        # Extract cards using appropriate handler
-        handler = create_card_handler(card_type)
-        cards = handler.extract_cards(content, file_path)
-        
-        # Create Anki notes
-        anki_notes = []
-        for front, back in cards:
-            note = {
-                'deckName': 'Obsidian Notes',
-                'modelName': 'Basic',
-                'fields': {
-                    'Front': convert_markdown_to_html(front),
-                    'Back': convert_markdown_to_html(back)
-                },
-                'options': {
-                    'allowDuplicate': False
-                },
-                'tags': tags
-            }
-            anki_notes.append(note)
-        
-        return anki_notes
+        content = f.read()
+    # Extract cards using appropriate handler
+    handler = create_card_handler(card_type)
+    cards = handler.extract_cards(content, file_path)
+    # Convert each card's content to HTML
+    converted_cards = []
+    for front, back in cards:
+        converted_front = convert_markdown_to_html(front)
+        converted_back = convert_markdown_to_html(back)
+        converted_cards.append((converted_front, converted_back))
+    return converted_cards
 
-def convert_directory(directory: Path, deck_name: str, card_type: str = 'qa') -> int:
-    """Convert all markdown files in directory to Anki cards."""
-    # Ensure directory exists
-    directory = Path(directory)
-    if not directory.exists():
-        raise FileNotFoundError(f"Directory not found: {directory}")
-    
-    # Ensure deck exists
-    ensure_deck_exists(deck_name)
-    
-    # Process all markdown files
-    added_notes = 0
+def convert_directory(directory: Path, deck_name: str, card_type: str) -> int:
+    """Convert all markdown files in a directory to Anki cards."""
+    total_notes = 0
     for file_path in directory.glob('**/*.md'):
-        notes = process_obsidian_file(file_path, card_type)
-        for note in notes:
-            note['deckName'] = deck_name
-            result = add_note(
-                deck_name=deck_name,
-                front=note['fields']['Front'],
-                back=note['fields']['Back'],
-                tags=note['tags']
-            )
-            if result.get('error') is None and result.get('result'):
-                added_notes += 1
-    
-    return added_notes 
+        try:
+            notes = process_obsidian_file(file_path, card_type)
+            for front, back in notes:
+                result = add_note(deck_name, front, back, ["obsidian"])
+                print(f"AnkiConnect response for {file_path}: {result}")
+                if result.get('error'):
+                    print(f"Error adding note from {file_path}: {result['error']}")
+                else:
+                    total_notes += 1
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+    return total_notes 
